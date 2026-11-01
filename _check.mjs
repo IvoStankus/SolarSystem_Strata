@@ -1,0 +1,1404 @@
+/* =====================================================================
+   SOLAR SYSTEM STRATA — single file interactive 3D orrery
+   ---------------------------------------------------------------------
+   0. Imports & boot guard
+   1. Scale model + physical data
+   2. Procedural (canvas) texture factory
+   3. Scene, camera, lights, post-processing
+   4. Star field, Sun, planets, moons, rings, asteroid belt
+   5. Orbital mechanics (Kepler solver + compressed radii)
+   6. Picking, camera focus / follow, HTML labels
+   7. HUD wiring, keyboard, animation loop
+   ===================================================================== */
+
+import * as THREE from 'three';
+import { OrbitControls }   from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass }      from 'three/addons/postprocessing/OutputPass.js';
+
+window.__boot = true;
+
+/* Surface unexpected runtime errors in the UI instead of a black screen. */
+addEventListener('error', ev => {
+  const f = document.getElementById('fatal');
+  if (f){
+    const h = f.querySelector('h2'), p = f.querySelector('p');
+    if (h) h.textContent = 'Unexpected runtime error';
+    if (p) p.textContent = (ev && ev.message ? ev.message : 'unknown error') +
+      ' - open the browser console for the stack trace.';
+    f.classList.add('show');
+  }
+  const l = document.getElementById('loader');
+  if (l) l.classList.add('gone');
+});
+
+/* =====================================================================
+   1. SCALE MODEL + DATA
+   Real values are used for the info cards; scene values are compressed.
+   ===================================================================== */
+
+const TAU = Math.PI * 2;
+const fAU = au => 32 * Math.pow(au, 0.62);     // AU -> scene units (compressed)
+const DAYS_PER_SEC = 4;                        // simulated days / real second at 1x
+const SPIN_SCALE   = 0.05;                     // Earth ~20 s per rotation at 1x
+const EPOCH = Date.UTC(2000, 0, 1, 12);        // J2000.0
+
+/* Orbital elements at J2000 (deg) so the starting layout is roughly real:
+   i  = inclination to the ecliptic, node = longitude of ascending node,
+   peri = longitude of perihelion, L0 = mean longitude at epoch.          */
+const PLANETS = [
+  {
+    name:'Mercury', kind:'Terrestrial planet', radius:0.62, color:'#a79a8d',
+    au:0.3871, ecc:0.2056, i:7.01, node:48.3, peri:77.5, L0:252.25,
+    periodDays:87.97, spinH:1407.6, tilt:0.03,
+    tex:{ type:'rocky', seed:11, craters:210, stops:[[0,'#4b453e'],[0.45,'#8d8377'],[0.8,'#b3a89a'],[1,'#cfc6ba']] },
+    facts:{ 'Diameter':'4,879 km', 'Distance from Sun':'57.9 M km (0.39 AU)', 'Orbital period':'88.0 Earth days',
+            'Solar day':'176 Earth days', 'Moons':'none', 'Temperature':'−173 → 427 °C', 'Surface gravity':'3.7 m/s²' },
+    fun:'Mercury’s day is longer than its year: the Sun rises, stalls, reverses, then rises again.',
+    moons:[]
+  },
+  {
+    name:'Venus', kind:'Terrestrial planet', radius:1.56, color:'#e2c290',
+    au:0.7233, ecc:0.0068, i:3.39, node:76.7, peri:131.5, L0:181.98,
+    periodDays:224.70, spinH:-5832.5, tilt:177.4,
+    tex:{ type:'banded', seed:23, bands:5, turb:0.55, stretch:2, oct:5,
+          stops:[[0,'#c79b58'],[0.4,'#e6c78d'],[0.7,'#f3e0b4'],[1,'#fff6de']] },
+    facts:{ 'Diameter':'12,104 km', 'Distance from Sun':'108.2 M km (0.72 AU)', 'Orbital period':'224.7 Earth days',
+            'Rotation':'243 days (retrograde)', 'Moons':'none', 'Surface temp':'464 °C', 'Surface pressure':'92× Earth' },
+    fun:'Venus turns backwards, and one Venusian day is <b>longer</b> than its year.',
+    moons:[]
+  },
+  {
+    name:'Earth', kind:'Terrestrial planet', radius:1.62, color:'#4b8fd6',
+    au:1.0000, ecc:0.0167, i:0.00, node:-11.26, peri:102.9, L0:100.46,
+    periodDays:365.256, spinH:23.934, tilt:23.44,
+    tex:{ type:'earth', seed:7 }, clouds:{ seed:41 }, atmo:{ color:'#5aa9ff', power:2.6, size:1.035, gain:1.15 },
+    facts:{ 'Diameter':'12,742 km', 'Distance from Sun':'149.6 M km (1.00 AU)', 'Orbital period':'365.25 days',
+            'Day length':'23 h 56 m', 'Moons':'1 (the Moon)', 'Surface water':'71%', 'Mean temp':'15 °C' },
+    fun:'The only world known to hold <b>liquid water oceans</b> on its surface — and the only one known to host life.',
+    moons:[
+      { name:'Moon', kind:'Natural satellite', radius:0.45, color:'#c8c5bd', dist:3.4, periodDays:27.32, phase:0.9,
+        tex:{ type:'rocky', seed:5, craters:180, stops:[[0,'#3f3d39'],[0.5,'#8f8b83'],[0.85,'#bdb9b0'],[1,'#ddd9d1']] },
+        facts:{ 'Diameter':'3,475 km', 'Distance from Earth':'384,400 km', 'Distance from Sun':'149.6 M km (1.00 AU)', 'Orbital period':'27.3 days',
+                'Rotation':'synchronous (locked)', 'Surface temp':'−173 → 127 °C', 'Surface gravity':'1.62 m/s²' },
+        fun:'The Moon drifts ~3.8 cm farther from Earth every year, and tidal locking means we only ever see one face.' }
+    ]
+  },
+  {
+    name:'Mars', kind:'Terrestrial planet', radius:1.17, color:'#c1653c',
+    au:1.5237, ecc:0.0934, i:1.85, node:49.6, peri:336.1, L0:355.45,
+    periodDays:686.98, spinH:24.623, tilt:25.19,
+    tex:{ type:'mars', seed:17, craters:95, stops:[[0,'#5f2f1d'],[0.42,'#a4532f'],[0.75,'#c97a48'],[1,'#e2a072']] },
+    atmo:{ color:'#ff8a5c', power:3.4, size:1.028, gain:0.5 },
+    facts:{ 'Diameter':'6,779 km', 'Distance from Sun':'227.9 M km (1.52 AU)', 'Orbital period':'687 Earth days',
+            'Day length':'24 h 37 m', 'Moons':'2 (Phobos, Deimos)', 'Mean temp':'−65 °C', 'Surface gravity':'3.72 m/s²' },
+    fun:'Olympus Mons rises ~22 km — nearly three Everests — and dust storms can wrap the whole planet.',
+    moons:[]
+  },
+  {
+    name:'Jupiter', kind:'Gas giant', radius:5.40, color:'#d8a76d',
+    au:5.2026, ecc:0.0489, i:1.30, node:100.5, peri:14.7, L0:34.40,
+    periodDays:4332.6, spinH:9.925, tilt:3.13,
+    tex:{ type:'banded', seed:31, bands:16, turb:0.85, stretch:3, oct:5, spot:{ x:0.62, y:0.63, rx:0.075, ry:0.035, c:'#b8563a' },
+          stops:[[0,'#6c4630'],[0.28,'#c39668'],[0.55,'#e8d5b5'],[0.78,'#f5e9d6'],[1,'#fffaf0']] },
+    atmo:{ color:'#ffd9a3', power:3.0, size:1.02, gain:0.55 },
+    facts:{ 'Diameter':'139,820 km', 'Distance from Sun':'778.5 M km (5.20 AU)', 'Orbital period':'11.86 years',
+            'Day length':'9 h 56 m (fastest spin)', 'Moons':'95 known', 'Mass':'318 Earths', 'Cloud temp':'−110 °C' },
+    fun:'The Great Red Spot is a storm <b>wider than Earth</b> that has been raging for at least 150 years.',
+    moons:[
+      { name:'Io', kind:'Natural satellite', radius:0.36, color:'#e8d376', dist:8.4, periodDays:1.769, phase:0.2,
+        tex:{ type:'rocky', seed:61, craters:26, stops:[[0,'#8a6f2c'],[0.5,'#d8bf5e'],[0.85,'#f0e08f'],[1,'#fff3c6']] },
+        facts:{ 'Diameter':'3,643 km', 'Distance from Jupiter':'421,700 km', 'Distance from Sun':'778.5 M km (5.20 AU)', 'Orbital period':'1.77 days',
+                'Volcanoes':'400+ active', 'Surface temp':'−143 °C', 'Surface gravity':'1.80 m/s²' },
+        fun:'The <b>most volcanically active body</b> in the Solar System — Jupiter’s tides knead its interior.' },
+      { name:'Europa', kind:'Natural satellite', radius:0.31, color:'#d9cbb4', dist:10.8, periodDays:3.551, phase:2.4,
+        tex:{ type:'ice', seed:67, stops:[[0,'#9e8f7c'],[0.5,'#d9cbb8'],[0.85,'#f0e7dc'],[1,'#fffaf2']] },
+        facts:{ 'Diameter':'3,122 km', 'Distance from Jupiter':'670,900 km', 'Distance from Sun':'778.5 M km (5.20 AU)', 'Orbital period':'3.55 days',
+                'Ice shell':'15–25 km thick', 'Surface temp':'−160 °C', 'Surface gravity':'1.31 m/s²' },
+        fun:'Beneath its cracked ice lies a global ocean holding roughly <b>twice all of Earth’s water</b>.' },
+      { name:'Ganymede', kind:'Natural satellite', radius:0.52, color:'#a89c90', dist:14.0, periodDays:7.155, phase:4.1,
+        tex:{ type:'rocky', seed:71, craters:130, stops:[[0,'#4f4a45'],[0.5,'#8b8279'],[0.85,'#b6ada3'],[1,'#d8cfc5']] },
+        facts:{ 'Diameter':'5,268 km', 'Distance from Jupiter':'1,070,400 km', 'Distance from Sun':'778.5 M km (5.20 AU)', 'Orbital period':'7.15 days',
+                'Size rank':'largest moon in the Solar System', 'Surface temp':'−160 °C', 'Surface gravity':'1.42 m/s²' },
+        fun:'Bigger than Mercury, and the only moon known to generate <b>its own magnetic field</b>.' },
+      { name:'Callisto', kind:'Natural satellite', radius:0.48, color:'#8c8073', dist:18.6, periodDays:16.689, phase:5.6,
+        tex:{ type:'rocky', seed:73, craters:260, stops:[[0,'#3b352e'],[0.5,'#7c7268'],[0.85,'#a9a096'],[1,'#cfc7bd']] },
+        facts:{ 'Diameter':'4,821 km', 'Distance from Jupiter':'1,882,700 km', 'Distance from Sun':'778.5 M km (5.20 AU)', 'Orbital period':'16.7 days',
+                'Surface age':'~4 billion years', 'Surface temp':'−140 °C', 'Surface gravity':'1.24 m/s²' },
+        fun:'Its surface is the <b>most heavily cratered</b> object known — a fossil landscape from the early Solar System.' }
+    ]
+  },
+  {
+    name:'Saturn', kind:'Gas giant', radius:4.60, color:'#e2cb92',
+    au:9.5549, ecc:0.0565, i:2.49, node:113.7, peri:92.4, L0:49.94,
+    periodDays:10759.2, spinH:10.656, tilt:26.73,
+    tex:{ type:'banded', seed:37, bands:9, turb:0.4, stretch:2, oct:4,
+          stops:[[0,'#9b7b46'],[0.35,'#cdae74'],[0.65,'#e8d6a8'],[1,'#fbf1d6']] },
+    atmo:{ color:'#ffe9b8', power:3.2, size:1.02, gain:0.45 },
+    ring:{ inner:1.28, outer:2.30, seed:101, opacity:0.92 },
+    facts:{ 'Diameter':'116,460 km', 'Distance from Sun':'1,434 M km (9.55 AU)', 'Orbital period':'29.4 years',
+            'Day length':'10 h 39 m', 'Moons':'146 known', 'Ring span':'282,000 km wide, often <20 m thick', 'Density':'0.69 g/cm³' },
+    fun:'Saturn is less dense than water — given a big enough ocean, it would <b>float</b>.',
+    moons:[
+      { name:'Titan', kind:'Natural satellite', radius:0.50, color:'#d99a4e', dist:22.5, periodDays:15.945, phase:1.3,
+        tex:{ type:'banded', seed:83, bands:4, turb:0.5, stretch:1, oct:4, haze:true,
+              stops:[[0,'#8a5a22'],[0.5,'#c58a3c'],[0.8,'#e2ab63'],[1,'#f6d79b']] },
+        atmo:{ color:'#ffb45e', power:2.4, size:1.10, gain:1.1 },
+        facts:{ 'Diameter':'5,150 km', 'Distance from Saturn':'1,221,900 km', 'Distance from Sun':'1,434 M km (9.55 AU)', 'Orbital period':'15.9 days',
+                'Atmosphere':'1.5× Earth’s pressure, 95% N₂', 'Surface temp':'−179 °C', 'Surface gravity':'1.35 m/s²' },
+        fun:'Rivers, lakes and rain — all of <b>liquid methane</b> — under a sky thicker than Earth’s.' },
+      { name:'Rhea', kind:'Natural satellite', radius:0.24, color:'#cfcac2', dist:16.8, periodDays:4.518, phase:3.9,
+        tex:{ type:'ice', seed:89, stops:[[0,'#6f6a64'],[0.5,'#b3ada6'],[0.85,'#d9d4cc'],[1,'#f2eee8']] },
+        facts:{ 'Diameter':'1,527 km', 'Distance from Saturn':'527,100 km', 'Distance from Sun':'1,434 M km (9.55 AU)', 'Orbital period':'4.5 days',
+                'Composition':'75% water ice', 'Surface temp':'−174 °C', 'Surface gravity':'0.26 m/s²' },
+        fun:'Rhea has a thin oxygen exosphere — and may be ringed by its own faint dust band.' },
+      { name:'Iapetus', kind:'Natural satellite (albedo dichotomy)', radius:0.30, color:'#a89f92', dist:26.4, periodDays:79.33, phase:5.1,
+        tex:{ type:'rocky', seed:91, craters:70,
+              stops:[[0,'#0b0a09'],[0.5,'#2c2925'],[1,'#524b42']],
+              split:{ u:0.5, w:0.045,
+                      dark:[[0,'#080706'],[0.5,'#26231f'],[1,'#4a443c']],
+                      bright:[[0,'#7d766b'],[0.5,'#d5cfc3'],[1,'#f8f5f0']] } },
+        facts:{ 'Diameter':'1,469 km', 'Distance from Saturn':'3,560,800 km', 'Distance from Sun':'1,434 M km (9.55 AU)', 'Orbital period':'79.3 days',
+                'Albedo':'0.03 leading / 0.60 trailing', 'Surface temp':'−144 °C', 'Equatorial ridge':'up to 20 km tall' },
+        fun:'One hemisphere is coal-dark and the other snow-bright, and a 20 km-high equatorial ridge wraps right around it — Iapetus looks like a cosmic walnut.' }
+    ]
+  },
+  {
+    name:'Uranus', kind:'Ice giant', radius:3.20, color:'#8fd0d8',
+    au:19.2184, ecc:0.0457, i:0.77, node:74.0, peri:170.9, L0:313.23,
+    periodDays:30688.5, spinH:-17.24, tilt:97.77,
+    tex:{ type:'banded', seed:43, bands:4, turb:0.22, stretch:1, oct:4,
+          stops:[[0,'#4d8f9b'],[0.45,'#7fc2ca'],[0.8,'#a8dee2'],[1,'#cdeff0']] },
+    atmo:{ color:'#9fe9ef', power:2.8, size:1.03, gain:0.85 },
+    ring:{ inner:1.62, outer:2.02, seed:107, opacity:0.32 },
+    facts:{ 'Diameter':'50,724 km', 'Distance from Sun':'2,871 M km (19.2 AU)', 'Orbital period':'84 years',
+            'Axial tilt':'97.8° (on its side)', 'Moons':'28 known', 'Mean temp':'−195 °C', 'Day length':'17 h 14 m (retro)' },
+    fun:'Uranus rolls on its side — likely knocked over by an ancient impact — so each pole gets <b>42 years of daylight</b>.',
+    moons:[
+      { name:'Titania', kind:'Natural satellite', radius:0.25, color:'#a9a29b', dist:8.6, periodDays:8.706, phase:2.2,
+        tex:{ type:'rocky', seed:97, craters:150, stops:[[0,'#4a453f'],[0.5,'#8b827a'],[0.85,'#b4aca4'],[1,'#d5cec6']] },
+        facts:{ 'Diameter':'1,578 km', 'Distance from Uranus':'436,300 km', 'Distance from Sun':'2,871 M km (19.2 AU)', 'Orbital period':'8.7 days',
+                'Canyons':'Messina Chasmata, ~1,500 km long', 'Surface temp':'−203 °C', 'Surface gravity':'0.38 m/s²' },
+        fun:'Largest moon of Uranus, scored by a canyon system longer than the Grand Canyon is wide.' },
+      { name:'Oberon', kind:'Natural satellite', radius:0.24, color:'#9d968f', dist:9.8, periodDays:13.463, phase:4.7,
+        tex:{ type:'rocky', seed:99, craters:190, stops:[[0,'#443f3a'],[0.5,'#7d746c'],[0.85,'#a9a199'],[1,'#cfc8c0']] },
+        facts:{ 'Diameter':'1,523 km', 'Distance from Uranus':'583,500 km', 'Distance from Sun':'2,871 M km (19.2 AU)', 'Orbital period':'13.5 days',
+                'Craters':'up to 21 km deep', 'Surface temp':'−203 °C', 'Surface gravity':'0.35 m/s²' },
+        fun:'The outermost of the major Uranian moons, and the most cratered of them all — its deepest crater floors may be dark material welling up from below.' }
+    ]
+  },
+  {
+    name:'Neptune', kind:'Ice giant', radius:3.10, color:'#4f76d8',
+    au:30.1104, ecc:0.0113, i:1.77, node:131.8, peri:44.9, L0:304.88,
+    periodDays:60195, spinH:16.11, tilt:28.32,
+    tex:{ type:'banded', seed:47, bands:5, turb:0.4, stretch:2, oct:5, spot:{ x:0.35, y:0.58, rx:0.06, ry:0.032, c:'#1b2f6b' },
+          stops:[[0,'#1c3768'],[0.4,'#35599f'],[0.7,'#4f7ac4'],[1,'#89aee2']] },
+    atmo:{ color:'#7fb2ff', power:2.5, size:1.035, gain:1.15 },
+    facts:{ 'Diameter':'49,244 km', 'Distance from Sun':'4,495 M km (30.1 AU)', 'Orbital period':'164.8 years',
+            'Day length':'16 h 6 m', 'Moons':'16 known', 'Winds':'up to 2,100 km/h', 'Mean temp':'−200 °C' },
+    fun:'Neptune was found in 1846 <b>by mathematics</b> — predicted from wobbles in Uranus’ orbit before it was seen.',
+    moons:[
+      { name:'Triton', kind:'Natural satellite', radius:0.30, color:'#d7cfc4', dist:6.6, periodDays:5.877, phase:0.7,
+        retro:true,
+        tex:{ type:'ice', seed:103, stops:[[0,'#8d8579'],[0.5,'#c9c1b4'],[0.85,'#e6ded1'],[1,'#fff8ee']] },
+        facts:{ 'Diameter':'2,707 km', 'Distance from Neptune':'354,800 km', 'Distance from Sun':'4,495 M km (30.1 AU)', 'Orbital period':'5.9 days (retrograde)',
+                'Origin':'captured Kuiper Belt object', 'Surface temp':'−235 °C', 'Surface gravity':'0.78 m/s²' },
+        fun:'It orbits backwards and is slowly falling inward — in tens of millions of years Neptune will tear it into a <b>ring</b>.' }
+    ]
+  }
+];
+
+const SUN = {
+  name:'Sun', kind:'G2V main-sequence star', radius:9, color:'#ffcf6b',
+  facts:{ 'Diameter':'1,392,700 km (109 Earths)', 'Distance from Sun':'0 km (system barycentre)',
+          'Mass':'1.989 × 10³⁰ kg (99.86% of the system)',
+          'Surface temp':'5,500 °C', 'Core temp':'15,000,000 °C', 'Rotation':'25.4 days at the equator',
+          'Composition':'73% hydrogen, 25% helium' },
+  fun:'Every second the Sun fuses ~600 million tonnes of hydrogen; the sunlight reaching your eyes left the core tens of thousands of years ago.'
+};
+
+/* =====================================================================
+   2. PROCEDURAL TEXTURE FACTORY
+   Value noise + canvas drawing. Seamless in longitude, deterministic.
+   ===================================================================== */
+
+const TEX_W = 512, TEX_H = 256;
+
+function hashInt(x, y, seed){
+  let h = (Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(seed | 0, 1442695041)) >>> 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h = (h ^ (h >>> 16)) >>> 0;
+  return h / 4294967295;
+}
+/* Bilinear value noise; the lattice wraps every `px` cells so the texture
+   has no visible longitude seam on the sphere. */
+function vnoise(x, y, px, py, seed){
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const x0 = ((xi % px) + px) % px, x1 = (x0 + 1) % px;
+  const y0 = ((yi % py) + py) % py, y1 = (y0 + 1) % py;
+  const n00 = hashInt(x0, y0, seed), n10 = hashInt(x1, y0, seed);
+  const n01 = hashInt(x0, y1, seed), n11 = hashInt(x1, y1, seed);
+  return (n00 + (n10 - n00) * u) * (1 - v) + (n01 + (n11 - n01) * u) * v;
+}
+function fbm(u, v, freq, oct, seed, stretch = 1){
+  let sum = 0, amp = 1, norm = 0, f = freq;
+  for (let o = 0; o < oct; o++){
+    sum  += amp * vnoise(u * f, v * f * stretch, f, f * stretch, seed + o * 7919);
+    norm += amp; amp *= 0.5; f *= 2;
+  }
+  return sum / norm;
+}
+const hexRGB = h => { const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; };
+const mixRGB = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+function ramp(st, t){
+  t = Math.min(1, Math.max(0, t));
+  for (let i = 0; i < st.length - 1; i++){
+    if (t <= st[i + 1][0]){
+      const k = (t - st[i][0]) / Math.max(1e-6, st[i + 1][0] - st[i][0]);
+      return mixRGB(st[i][1], st[i + 1][1], k);
+    }
+  }
+  return st[st.length - 1][1];
+}
+const parseStops = stops => stops.map(([p, c]) => [p, hexRGB(c)]);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+
+function newCanvas(w, h){ const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+let maxAniso = 4;
+function finish(c){
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = THREE.RepeatWrapping;
+  t.wrapT = THREE.ClampToEdgeWrapping;
+  t.anisotropy = maxAniso;
+  return t;
+}
+
+/* --- banded / gas-giant / venus / titan surface ---------------------- */
+function texBanded(o){
+  const c = newCanvas(TEX_W, TEX_H), ctx = c.getContext('2d');
+  const img = ctx.createImageData(TEX_W, TEX_H), d = img.data;
+  const st = parseStops(o.stops);
+  for (let y = 0; y < TEX_H; y++){
+    const v = y / TEX_H;
+    for (let x = 0; x < TEX_W; x++){
+      const u = x / TEX_W;
+      const warp = fbm(u, v, 6, 3, o.seed, o.stretch) * 2 - 1;
+      const fine = fbm(u, v, 20, 4, o.seed + 911, Math.max(1, o.stretch * 2));
+      const p = v * o.bands + warp * o.turb + (fine - 0.5) * 0.5;
+      const t = clamp(0.5 - 0.5 * Math.cos(p * TAU), 0, 1);
+      const col = ramp(st, t);
+      const sh = 0.90 + 0.20 * fine + (o.haze ? 0.05 * Math.cos(v * Math.PI) : 0);
+      const i = (y * TEX_W + x) * 4;
+      d[i] = clamp(col[0] * sh, 0, 255); d[i+1] = clamp(col[1] * sh, 0, 255); d[i+2] = clamp(col[2] * sh, 0, 255); d[i+3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  /* Great Dark / Red Spot style vortex */
+  if (o.spot){
+    ctx.save();
+    ctx.translate(o.spot.x * TEX_W, o.spot.y * TEX_H);
+    ctx.scale(o.spot.rx * TEX_W, o.spot.ry * TEX_H);
+    const g = ctx.createRadialGradient(0, 0, 0.15, 0, 0, 1);
+    const sc = hexRGB(o.spot.c);
+    g.addColorStop(0, `rgba(${sc[0]},${sc[1]},${sc[2]},0.95)`);
+    g.addColorStop(0.65, `rgba(${sc[0]},${sc[1]},${sc[2]},0.55)`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, 1, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+  return finish(c);
+}
+
+/* --- cratered rock: Mercury, Moon, Callisto, Ganymede, Titania ------ */
+function texRocky(o){
+  const c = newCanvas(TEX_W, TEX_H), ctx = c.getContext('2d');
+  const img = ctx.createImageData(TEX_W, TEX_H), d = img.data;
+  const st = parseStops(o.stops);
+  /* Iapetus-style albedo dichotomy: two colour ramps blended over two
+     hemispheres (dark centred on u=0, bright centred on split.u).       */
+  const sp = o.split ? { u:o.split.u, w:o.split.w, dark:parseStops(o.split.dark), bright:parseStops(o.split.bright) } : null;
+  for (let y = 0; y < TEX_H; y++){
+    const v = y / TEX_H;
+    for (let x = 0; x < TEX_W; x++){
+      const u = x / TEX_W;
+      const base = fbm(u, v, 4, 4, o.seed, 1);
+      const fine = fbm(u, v, 28, 4, o.seed + 311, 1);
+      const t = clamp(base * 0.7 + fine * 0.45, 0, 1);
+      let col;
+      if (sp){
+        /* periodic blend (u wraps!): one dark + one bright hemisphere with
+           a soft boundary on each side, so the texture seam stays smooth  */
+        const s = 0.5 + 0.5 * Math.cos((u - sp.u) * Math.PI * 2);
+        let k = clamp((s - 0.5) / (2 * sp.w) + 0.5, 0, 1);
+        k = k * k * (3 - 2 * k);
+        const cd = ramp(sp.dark, t), cb = ramp(sp.bright, t);
+        col = [ cd[0] + (cb[0] - cd[0]) * k, cd[1] + (cb[1] - cd[1]) * k, cd[2] + (cb[2] - cd[2]) * k ];
+      } else col = ramp(st, t);
+      const i = (y * TEX_W + x) * 4;
+      d[i] = col[0]; d[i+1] = col[1]; d[i+2] = col[2]; d[i+3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  /* craters drawn with radial gradients (cheap, and they read beautifully
+     as bump maps too). Wrapped across the longitude seam.             */
+  let s = o.seed * 9301 + 49297;
+  const rnd = () => ((s = (s * 9301 + 49297) % 233280) / 233280);
+  for (let k = 0; k < o.craters; k++){
+    const cx = rnd() * TEX_W, cy = TEX_H * (0.05 + rnd() * 0.9);
+    const r  = 1.5 + Math.pow(rnd(), 3) * 22;
+    for (const off of [-TEX_W, 0, TEX_W]){
+      if (Math.abs(cx + off - TEX_W / 2) > TEX_W / 2 + r) continue;
+      const g = ctx.createRadialGradient(cx + off, cy, r * 0.1, cx + off, cy, r);
+      g.addColorStop(0,    'rgba(0,0,0,0.30)');
+      g.addColorStop(0.62, 'rgba(0,0,0,0.12)');
+      g.addColorStop(0.80, 'rgba(255,255,255,0.20)');
+      g.addColorStop(1,    'rgba(255,255,255,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx + off, cy, r, 0, TAU); ctx.fill();
+    }
+  }
+  return finish(c);
+}
+
+/* --- Mars: rust, dark albedo provinces, polar caps ------------------ */
+function texMars(o){
+  const c = newCanvas(TEX_W, TEX_H), ctx = c.getContext('2d');
+  const img = ctx.createImageData(TEX_W, TEX_H), d = img.data;
+  const st = parseStops(o.stops);
+  for (let y = 0; y < TEX_H; y++){
+    const v = y / TEX_H, lat = (v - 0.5) * 2;
+    for (let x = 0; x < TEX_W; x++){
+      const u = x / TEX_W;
+      const base = fbm(u, v, 3, 5, o.seed, 1);
+      const dark = fbm(u, v, 7, 4, o.seed + 55, 1);
+      const fine = fbm(u, v, 30, 3, o.seed + 707, 1);
+      let t = clamp(base * 0.8 + fine * 0.35 - (dark > 0.58 ? (dark - 0.58) * 1.15 : 0), 0, 1);
+      const col = ramp(st, t);
+      /* polar caps */
+      const capEdge = 0.80 + 0.07 * fbm(u, 0, 9, 3, o.seed + 5, 1);
+      if (Math.abs(lat) > capEdge){
+        const k = clamp((Math.abs(lat) - capEdge) / 0.14, 0, 1);
+        const ice = [236, 240, 244];
+        col[0] += (ice[0] - col[0]) * k; col[1] += (ice[1] - col[1]) * k; col[2] += (ice[2] - col[2]) * k;
+      }
+      const i = (y * TEX_W + x) * 4;
+      d[i] = col[0]; d[i+1] = col[1]; d[i+2] = col[2]; d[i+3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  let s = o.seed * 7717 + 1;
+  const rnd = () => ((s = (s * 9301 + 49297) % 233280) / 233280);
+  for (let k = 0; k < o.craters; k++){
+    const cx = rnd() * TEX_W, cy = TEX_H * (0.12 + rnd() * 0.76), r = 1.5 + Math.pow(rnd(), 3) * 12;
+    const g = ctx.createRadialGradient(cx, cy, r * 0.1, cx, cy, r);
+    g.addColorStop(0, 'rgba(0,0,0,0.26)'); g.addColorStop(0.75, 'rgba(255,255,255,0.13)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, r, 0, TAU); ctx.fill();
+  }
+  return finish(c);
+}
+
+/* --- Earth: oceans, continents, climate-zoned land, ice caps -------- */
+function texEarth(o){
+  const c = newCanvas(TEX_W, TEX_H), ctx = c.getContext('2d');
+  const img = ctx.createImageData(TEX_W, TEX_H), d = img.data;
+  const deep = hexRGB('#07224a'), shal = hexRGB('#1d6398'), coast = hexRGB('#2f6b3a');
+  const green = hexRGB('#3f7d3c'), dry  = hexRGB('#a98a52'), tundra = hexRGB('#6f7d63'), rock = hexRGB('#8d8477');
+  for (let y = 0; y < TEX_H; y++){
+    const v = y / TEX_H, lat = (v - 0.5) * 2;
+    for (let x = 0; x < TEX_W; x++){
+      const u = x / TEX_W;
+      const cont  = fbm(u, v, 2, 5, o.seed, 1);                 // continents
+      const detail= fbm(u, v, 9, 4, o.seed + 137, 1);
+      const fine  = fbm(u, v, 34, 3, o.seed + 991, 1);
+      const h = cont * 0.72 + detail * 0.28 + (fine - 0.5) * 0.05;
+      let col;
+      if (h <= 0.50){
+        col = mixRGB(deep, shal, clamp(h / 0.50, 0, 1) ** 1.6);
+      } else {
+        const e = (h - 0.50) / 0.32;                            // elevation
+        const absLat = Math.abs(lat);
+        let bio = mixRGB(coast, green, clamp(detail * 1.3, 0, 1));
+        if (absLat < 0.14) bio = mixRGB(bio, hexRGB('#2c5f2c'), 0.55 * detail);        // rainforest
+        else if (absLat > 0.16 && absLat < 0.36) bio = mixRGB(bio, dry, clamp(0.75 - detail * 0.4, 0, 1)); // desert belts
+        else if (absLat > 0.62) bio = mixRGB(bio, tundra, 0.75);
+        col = mixRGB(bio, rock, clamp(e * 1.2, 0, 1) * 0.55 + clamp(e - 0.55, 0, 1));
+        if (e > 0.72) col = mixRGB(col, hexRGB('#eef3f7'), clamp((e - 0.72) * 3, 0, 1)); // snow caps
+      }
+      /* sea ice / ice sheets */
+      const iceEdge = 0.795 + 0.055 * fbm(u, 0, 11, 3, o.seed + 21, 1);
+      if (Math.abs(lat) > iceEdge){
+        const k = clamp((Math.abs(lat) - iceEdge) / 0.12, 0, 1);
+        col = mixRGB(col, hexRGB('#f2f7fb'), k);
+      }
+      const i = (y * TEX_W + x) * 4;
+      d[i] = col[0]; d[i+1] = col[1]; d[i+2] = col[2]; d[i+3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return finish(c);
+}
+
+/* --- icy moons (Europa, Rhea, Triton): bright + fracture hatching --- */
+function texIce(o){
+  const tex = texRocky({ ...o, craters: 22 });
+  const c = tex.image, ctx = c.getContext('2d');
+  let s = o.seed * 4111 + 3;
+  const rnd = () => ((s = (s * 9301 + 49297) % 233280) / 233280);
+  ctx.lineCap = 'round';
+  for (let k = 0; k < 60; k++){
+    const y0 = rnd() * c.height, x0 = rnd() * c.width;
+    const len = 40 + rnd() * 220, ang = (rnd() - 0.5) * 1.1;
+    ctx.strokeStyle = rnd() > 0.45 ? 'rgba(126,88,62,0.30)' : 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 0.6 + rnd() * 2.2;
+    ctx.beginPath(); ctx.moveTo(x0, y0);
+    for (let p = 1; p <= 6; p++){
+      ctx.lineTo(x0 + Math.cos(ang) * len * p / 6, y0 + Math.sin(ang) * len * p / 6 + (rnd() - 0.5) * 6);
+    }
+    ctx.stroke();
+  }
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/* --- cloud layer (alpha map, RGBA) ---------------------------------- */
+function texClouds(o){
+  const c = newCanvas(TEX_W, TEX_H), ctx = c.getContext('2d');
+  const img = ctx.createImageData(TEX_W, TEX_H), d = img.data;
+  for (let y = 0; y < TEX_H; y++){
+    const v = y / TEX_H, lat = (v - 0.5) * 2;
+    /* three cloud belts: ITCZ near the equator, stormy mid/high latitudes,
+       dry subtropics around +-25 deg, just like real circulation cells  */
+    const band = 0.55 + 0.45 * Math.cos(lat * Math.PI * 3.0 + 0.6);
+    for (let x = 0; x < TEX_W; x++){
+      const u = x / TEX_W;
+      const n = fbm(u, v, 5, 5, o.seed, 2) * 0.75 + fbm(u, v, 18, 3, o.seed + 71, 3) * 0.25;
+      let a = clamp((n - (0.62 - 0.28 * band)) * 4.2, 0, 1);
+      a = a * a * (3 - 2 * a);
+      const i = (y * TEX_W + x) * 4;
+      d[i] = 255; d[i+1] = 255; d[i+2] = 255; d[i+3] = a * 235;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return finish(c);
+}
+
+/* --- Sun surface: granulation, faculae, sunspots -------------------- */
+function texSun(seed){
+  const c = newCanvas(TEX_W, TEX_H), ctx = c.getContext('2d');
+  const img = ctx.createImageData(TEX_W, TEX_H), d = img.data;
+  for (let y = 0; y < TEX_H; y++){
+    for (let x = 0; x < TEX_W; x++){
+      const u = x / TEX_W, v = y / TEX_H;
+      const g = fbm(u, v, 42, 4, seed, 1);
+      const m = fbm(u, v, 7, 4, seed + 401, 1);
+      let t = clamp(g * 0.75 + m * 0.45, 0, 1);
+      const r = clamp(250 * (0.72 + 0.35 * t), 0, 255);
+      const gr = clamp(200 * (0.55 + 0.55 * t), 0, 255);
+      const b = clamp(140 * (0.25 + 0.9 * t * t), 0, 255);
+      const i = (y * TEX_W + x) * 4;
+      d[i] = r; d[i+1] = gr; d[i+2] = b;
+      d[i+3] = 255;
+      /* green channel is sampled separately by the sun shader for a
+         second, differently scrolling layer -> shimmering granulation */
+      d[i+1] = clamp(255 * (0.35 + 0.65 * m), 0, 255);
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  /* sunspot groups */
+  let s = seed * 1237 + 9;
+  const rnd = () => ((s = (s * 9301 + 49297) % 233280) / 233280);
+  for (let k = 0; k < 16; k++){
+    const cx = rnd() * TEX_W, cy = TEX_H * (0.25 + rnd() * 0.5), r = 3 + Math.pow(rnd(), 2) * 14;
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+    g.addColorStop(0, 'rgba(70,32,8,0.75)'); g.addColorStop(0.55, 'rgba(150,80,20,0.35)'); g.addColorStop(1, 'rgba(255,220,150,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, r, 0, TAU); ctx.fill();
+  }
+  return finish(c);
+}
+
+/* --- planet rings: 1D radial profile with Cassini-style divisions --- */
+function texRing(o){
+  const W = 1024;
+  const c = newCanvas(W, 8), ctx = c.getContext('2d');
+  const img = ctx.createImageData(W, 8), d = img.data;
+  for (let x = 0; x < W; x++){
+    const t = x / (W - 1);
+    let a = 0.55 + 0.45 * Math.sin(t * 52) * 0.35 + 0.5 * fbm(t, 0.5, 30, 4, o.seed, 1);
+    a = clamp(a, 0, 1);
+    /* divisions */
+    const gap = (c0, w) => clamp(Math.abs(t - c0) / w, 0, 1);
+    a *= 0.08 + 0.92 * gap(0.62, 0.035);            // Cassini division
+    a *= 0.25 + 0.75 * gap(0.12, 0.05);             // inner C ring fade
+    a *= 0.30 + 0.70 * gap(0.93, 0.06);             // outer edge fade
+    const lum = 0.72 + 0.28 * fbm(t, 0.2, 60, 3, o.seed + 17, 1);
+    const col = mixRGB(hexRGB('#6c5a44'), hexRGB('#f6ecd6'), lum);
+    for (let y = 0; y < 8; y++){
+      const i = (y * W + x) * 4;
+      d[i] = col[0]; d[i+1] = col[1]; d[i+2] = col[2]; d[i+3] = a * 255 * o.opacity;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const t = finish(c);
+  t.wrapT = THREE.ClampToEdgeWrapping;
+  return t;
+}
+
+/* --- soft radial sprites (corona, stars, selection ring) ------------ */
+function texGlow(color, soft = 0.55){
+  const S = 256, c = newCanvas(S, S), ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(S/2, S/2, 0, S/2, S/2, S/2);
+  const [r, gr, b] = hexRGB(color);
+  g.addColorStop(0,    `rgba(255,255,255,1)`);
+  g.addColorStop(0.12, `rgba(${r},${gr},${b},0.85)`);
+  g.addColorStop(soft, `rgba(${r},${gr},${b},0.18)`);
+  g.addColorStop(1,    `rgba(${r},${gr},${b},0)`);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, S, S);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+function texSelectRing(){
+  const S = 256, c = newCanvas(S, S), ctx = c.getContext('2d');
+  ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.arc(S/2, S/2, S*0.40, 0, TAU); ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 14;
+  ctx.beginPath(); ctx.arc(S/2, S/2, S*0.44, 0, TAU); ctx.stroke();
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+function texStar(){
+  const S = 64, c = newCanvas(S, S), ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(S/2, S/2, 0, S/2, S/2, S/2);
+  g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.25, 'rgba(255,255,255,0.55)');
+  g.addColorStop(0.6, 'rgba(255,255,255,0.08)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, S, S);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+
+/* =====================================================================
+   3. RENDERER, SCENE, CAMERA, CONTROLS, POST-PROCESSING
+   ===================================================================== */
+
+const viewport = document.getElementById('viewport');
+const renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+viewport.appendChild(renderer.domElement);
+maxAniso = renderer.capabilities.getMaxAnisotropy();
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.2, 8000);
+camera.position.set(0, 42, 118);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.065;
+controls.rotateSpeed = 0.65;
+controls.zoomSpeed = 0.9;
+controls.panSpeed = 0.7;
+controls.minDistance = 0.25;
+controls.maxDistance = 1200;
+controls.target.set(0, 0, 0);
+
+/* Light: the Sun is a point source at the origin. decay = 0 keeps every
+   planet reasonably lit despite the compressed distance scale.        */
+const sunLight = new THREE.PointLight(0xfff3dd, 2.45, 0, 0);
+sunLight.castShadow = true;
+/* Shadow camera is deliberately short-range: a single point-light cube map
+   cannot cover 18 -> 270 scene units with good texel precision, so the map
+   only reaches as far as Saturn. Real moon/ring shadows happen there; the
+   ice giants are simply unshadowed (no artifacts, no cost).            */
+sunLight.shadow.mapSize.set(1024, 1024);
+sunLight.shadow.camera.near = 3;
+sunLight.shadow.camera.far = 170;
+sunLight.shadow.bias = 0;            // depth bias scales badly over this range
+sunLight.shadow.normalBias = 0.035;  // world-space offset: distance independent
+sunLight.shadow.radius = 3;          // soft PCF (renderer uses PCFSoftShadowMap)
+scene.add(sunLight);
+scene.add(new THREE.AmbientLight(0x2f4666, 0.30));   // faint starlight fill
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.85, 0.6, 0.62);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+let useBloom = true;
+
+/* =====================================================================
+   4. BUILD THE UNIVERSE
+   ===================================================================== */
+
+const labelsEl = document.getElementById('labels');
+const entries = [];      // one record per pickable body
+const pickables = [];
+const orbitLines = [];   // planet orbit lines
+const moonOrbitLines = [];
+const atmoMats = [];     // fresnel materials that need the sun direction
+const disposables = [];
+const track = o => { disposables.push(o); return o; };
+
+function makeLabel(text, cls, color){
+  const el = document.createElement('div');
+  el.className = 'label ' + cls;
+  el.innerHTML = `<span class="dot" style="background:${color}"></span>${text}`;
+  el.title = text;
+  labelsEl.appendChild(el);
+  return el;
+}
+
+/* ------------------------------------------------------------------ */
+/* Star field + faint nebulae                                          */
+function buildStars(){
+  const group = new THREE.Group();
+  const sprite = track(texStar());
+  const layers = [
+    { n:5200, size:1.5, dim:0.55 },
+    { n:1800, size:2.6, dim:0.85 },
+    { n:420,  size:4.2, dim:1.0  }
+  ];
+  const R = 2600;
+  layers.forEach((L, li) => {
+    const pos = new Float32Array(L.n * 3), col = new Float32Array(L.n * 3);
+    for (let i = 0; i < L.n; i++){
+      // cluster the dimmer layer toward the galactic plane (Milky Way band)
+      let u = Math.random() * 2 - 1, v = Math.random() * TAU;
+      if (li === 0 && Math.random() < 0.55) u *= 0.22;
+      const x = R * Math.sqrt(1 - u * u) * Math.cos(v), y = R * u, z = R * Math.sqrt(1 - u * u) * Math.sin(v);
+      pos[i*3] = x; pos[i*3+1] = y; pos[i*3+2] = z;
+      const warm = Math.random(), b = (0.55 + 0.45 * Math.random()) * L.dim;
+      const c = warm < 0.12 ? [1.0*b, 0.72*b, 0.55*b] : warm < 0.25 ? [1.0*b, 0.92*b, 0.78*b] : [0.86*b, 0.93*b, 1.0*b];
+      col[i*3] = c[0]; col[i*3+1] = c[1]; col[i*3+2] = c[2];
+    }
+    const geo = track(new THREE.BufferGeometry());
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    const mat = track(new THREE.PointsMaterial({
+      size:L.size, map:sprite, vertexColors:true, transparent:true,
+      depthWrite:false, blending:THREE.AdditiveBlending, sizeAttenuation:false
+    }));
+    const pts = new THREE.Points(geo, mat);
+    pts.frustumCulled = false;
+    pts.renderOrder = -2;
+    group.add(pts);
+  });
+  /* a handful of very soft nebula clouds for depth */
+  const neb = track(texGlow('#7aa6ff', 0.5));
+  for (let i = 0; i < 6; i++){
+    const m = track(new THREE.SpriteMaterial({
+      map:neb, color:new THREE.Color([0x5f7fd8, 0x8f6fd0, 0x4f9fbf][i % 3]),
+      transparent:true, opacity:0.11, depthWrite:false, blending:THREE.AdditiveBlending
+    }));
+    const s = new THREE.Sprite(m);
+    const a = Math.random() * TAU, d2 = (Math.random() - 0.5) * 1.2;
+    s.position.set(Math.cos(a) * 2100, d2 * 1500, Math.sin(a) * 2100);
+    const sc = 900 + Math.random() * 1100; s.scale.set(sc, sc, 1);
+    s.renderOrder = -1;
+    group.add(s);
+  }
+  scene.add(group);
+  return group;
+}
+const starGroup = buildStars();
+
+/* ------------------------------------------------------------------ */
+/* The Sun: emissive animated surface + corona sprites                 */
+function buildSun(){
+  const anchor = new THREE.Object3D();
+  scene.add(anchor);
+
+  const sunTex = track(texSun(5));
+  const mat = track(new THREE.ShaderMaterial({
+    uniforms:{ uMap:{ value:sunTex }, uTime:{ value:0 } },
+    vertexShader: `
+      varying vec2 vUv; varying vec3 vN; varying vec3 vV;
+      void main(){
+        vUv = uv;
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        vV = normalize(-mv.xyz);
+        vN = normalize(normalMatrix * normal);
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `
+      uniform sampler2D uMap; uniform float uTime;
+      varying vec2 vUv; varying vec3 vN; varying vec3 vV;
+      void main(){
+        float g = texture2D(uMap, vUv + vec2(uTime * 0.0035, 0.0)).r;
+        float h = texture2D(uMap, vUv * vec2(1.7, 1.4) + vec2(-uTime * 0.0062, uTime * 0.0021)).g;
+        float t = clamp(g * 0.8 + h * 0.5, 0.0, 1.0);
+        vec3 c = mix(vec3(0.98, 0.45, 0.10), vec3(1.00, 0.90, 0.62), t);
+        float limb = pow(clamp(dot(normalize(vN), normalize(vV)), 0.0, 1.0), 0.55);
+        c *= 0.72 + 0.62 * limb;          // limb darkening
+        c *= 2.0;                          // push above 1.0 -> bloom picks it up
+        gl_FragColor = vec4(c, 1.0);
+      }`
+  }));
+  const mesh = new THREE.Mesh(track(new THREE.SphereGeometry(SUN.radius, 64, 40)), mat);
+  anchor.add(mesh);
+
+  /* corona: two additive sprites (billboarded, so no geometry cost) */
+  const coronaTex = track(texGlow('#ffcf7a', 0.5));
+  const coronas = [];
+  for (const [s, op] of [[SUN.radius * 5.4, 0.30], [SUN.radius * 12.5, 0.11]]){
+    const m = track(new THREE.SpriteMaterial({
+      map:coronaTex, color:0xffc978, transparent:true, opacity:op,
+      depthWrite:false, blending:THREE.AdditiveBlending
+    }));
+    const sp = new THREE.Sprite(m);
+    sp.scale.set(s, s, 1);
+    sp.renderOrder = 1;
+    anchor.add(sp); coronas.push(sp);
+  }
+
+  const el = makeLabel('Sun', '', SUN.color);
+  const entry = { data:SUN, anchor, mesh, moons:[], corona:coronas, sunMat:mat, labelEl:el, kind:SUN.kind };
+  el.addEventListener('click', e => { e.stopPropagation(); focusOn(entry); });
+  entries.push(entry); pickables.push(mesh);
+  mesh.userData.entry = entry;
+  return entry;
+}
+const sunEntry = buildSun();
+
+/* ------------------------------------------------------------------ */
+/* Planets, moons, rings, atmospheres, orbit paths                     */
+function planetOrbit(planet){
+  const { i, node, peri } = planet;
+  const orbitGroup = new THREE.Object3D();
+  orbitGroup.rotation.y = THREE.MathUtils.degToRad(node);
+  const incGroup = new THREE.Object3D();
+  incGroup.rotation.x = THREE.MathUtils.degToRad(i);
+  const periGroup = new THREE.Object3D();
+  periGroup.rotation.y = THREE.MathUtils.degToRad(peri - node);
+  orbitGroup.add(incGroup); incGroup.add(periGroup);
+  scene.add(orbitGroup);
+  return periGroup;
+}
+
+/* sample the Kepler ellipse (with the compressed radius law) once  */
+function orbitPath(planet, segments = 256){
+  const geo = track(new THREE.BufferGeometry());
+  const pts = new Float32Array((segments + 1) * 3);
+  const e = planet.ecc, b = Math.sqrt(1 - e * e);
+  for (let k = 0; k <= segments; k++){
+    const E = k / segments * TAU;
+    const x = planet.au * (Math.cos(E) - e);
+    const z = planet.au * b * Math.sin(E);
+    const rAU = Math.hypot(x, z), th = Math.atan2(z, x);
+    const rs = fAU(rAU);
+    pts[k*3] = Math.cos(th) * rs; pts[k*3+1] = 0; pts[k*3+2] = Math.sin(th) * rs;
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+  return geo;
+}
+
+function makeAtmosphere(radius, a, parent){
+  const mat = track(new THREE.ShaderMaterial({
+    uniforms:{
+      uColor:{ value:new THREE.Color(a.color) },
+      uPower:{ value:a.power },
+      uGain:{ value:a.gain },
+      uSun:{ value:new THREE.Vector3(1, 0, 0) }
+    },
+    vertexShader: `
+      varying vec3 vWN; varying vec3 vWP;
+      void main(){
+        vWN = normalize(mat3(modelMatrix) * normal);
+        vWP = (modelMatrix * vec4(position, 1.0)).xyz;
+        gl_Position = viewMatrix * vec4(vWP, 1.0);
+      }`,
+    fragmentShader: `
+      uniform vec3 uColor; uniform float uPower; uniform float uGain; uniform vec3 uSun;
+      varying vec3 vWN; varying vec3 vWP;
+      void main(){
+        vec3 V = normalize(cameraPosition - vWP);
+        float rim = pow(1.0 - abs(dot(vWN, V)), uPower);            // limb glow
+        float lit = clamp(dot(vWN, uSun) * 1.35 + 0.20, 0.0, 1.0);  // night side stays dark
+        gl_FragColor = vec4(uColor * rim * lit * uGain, rim * lit * uGain);
+      }`,
+    transparent:true, blending:THREE.AdditiveBlending, depthWrite:false, side:THREE.BackSide
+  }));
+  const m = new THREE.Mesh(track(new THREE.SphereGeometry(radius * a.size, 48, 28)), mat);
+  parent.add(m);
+  return mat;
+}
+
+function makeRing(r, parent, ringDef){
+  const inner = r * ringDef.inner, outer = r * ringDef.outer;
+  const geo = track(new THREE.RingGeometry(inner, outer, 160, 3));
+  /* remap UVs so u runs radially — the default RingGeometry UVs do not */
+  const pos = geo.attributes.position, uv = geo.attributes.uv;
+  for (let k = 0; k < pos.count; k++){
+    const rad = Math.hypot(pos.getX(k), pos.getY(k));
+    uv.setXY(k, (rad - inner) / (outer - inner), 0.5);
+  }
+  uv.needsUpdate = true;
+  const tex = track(texRing({ seed:ringDef.seed, opacity:ringDef.opacity }));
+  const mat = track(new THREE.MeshStandardMaterial({
+    map:tex, transparent:true, side:THREE.DoubleSide, roughness:0.95, metalness:0, depthWrite:false,
+    alphaTest:0.06                 // so the ring's gaps also cut its shadow
+  }));
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.x = -Math.PI / 2;         // ring plane = planet's equator
+  mesh.castShadow = true;                 // rings shade the planet
+  mesh.receiveShadow = true;
+  parent.add(mesh);
+  return mesh;
+}
+
+function buildPlanet(planet){
+  const periGroup = planetOrbit(planet);
+
+  /* anchor rides the orbit; tiltNode holds axial tilt; mesh spins      */
+  const anchor = new THREE.Object3D();
+  periGroup.add(anchor);
+  const tiltNode = new THREE.Object3D();
+  tiltNode.rotation.z = THREE.MathUtils.degToRad(planet.tilt);
+  anchor.add(tiltNode);
+
+  const segs = planet.radius > 3 ? 64 : 48;
+  const map = (() => {
+    switch (planet.tex.type){
+      case 'banded': return texBanded(planet.tex);
+      case 'earth':  return texEarth(planet.tex);
+      case 'mars':   return texMars(planet.tex);
+      case 'ice':    return texIce(planet.tex);
+      default:       return texRocky(planet.tex);
+    }
+  })();
+  track(map);
+  const isGas = planet.kind === 'Gas giant' || planet.kind === 'Ice giant';
+  const mat = track(new THREE.MeshStandardMaterial({
+    map, roughness: isGas ? 0.72 : 0.93, metalness: 0,
+    bumpMap: map, bumpScale: isGas ? 0.004 : 0.02
+  }));
+  const mesh = new THREE.Mesh(track(new THREE.SphereGeometry(planet.radius, segs, segs * 0.62)), mat);
+  mesh.castShadow = true; mesh.receiveShadow = true;
+  tiltNode.add(mesh);
+
+  /* cloud shell (Earth) rides just above the surface, drifting         */
+  let cloudMesh = null;
+  if (planet.clouds){
+    const cm = track(new THREE.MeshStandardMaterial({
+      alphaMap: track(texClouds(planet.clouds)), transparent:true, opacity:0.92,
+      color:0xffffff, roughness:1, metalness:0, depthWrite:false
+    }));
+    cloudMesh = new THREE.Mesh(track(new THREE.SphereGeometry(planet.radius * 1.014, 48, 28)), cm);
+    tiltNode.add(cloudMesh);
+  }
+  if (planet.atmo) atmoMats.push({ mat: makeAtmosphere(planet.radius, planet.atmo, anchor), anchor });
+  if (planet.ring) makeRing(planet.radius, tiltNode, planet.ring);
+
+  /* orbit path */
+  const lineMat = track(new THREE.LineBasicMaterial({ color:new THREE.Color(planet.color), transparent:true, opacity:0.22 }));
+  const line = new THREE.Line(orbitPath(planet), lineMat);
+  periGroup.add(line);
+  orbitLines.push({ line, mat:lineMat, base:0.22, entry:null });
+
+  const labelEl = makeLabel(planet.name, '', planet.color);
+  const entry = { data:planet, anchor, mesh, tiltNode, cloudMesh, labelEl, kind:planet.kind,
+                  orbitLine:orbitLines[orbitLines.length - 1], moons:[] };
+  labelEl.addEventListener('click', e => { e.stopPropagation(); focusOn(entry); });
+  mesh.userData.entry = entry;
+  entries.push(entry); pickables.push(mesh);
+  orbitLines[orbitLines.length - 1].entry = entry;
+
+  /* ---- moons ---- */
+  (planet.moons || []).forEach(m => {
+    const moonOrbit = new THREE.Object3D();
+    moonOrbit.rotation.x = THREE.MathUtils.degToRad(5 + (m.dist % 3));   // slight mutual tilts
+    tiltNode.add(moonOrbit);
+    const mAnchor = new THREE.Object3D(); moonOrbit.add(mAnchor);
+
+    const mTex = track(m.tex.type === 'ice' ? texIce(m.tex) : texRocky(m.tex));
+    const mMat = track(new THREE.MeshStandardMaterial({
+      map:mTex, bumpMap:mTex, bumpScale:0.015, roughness:0.95, metalness:0
+    }));
+    const mMesh = new THREE.Mesh(track(new THREE.SphereGeometry(m.radius, 32, 20)), mMat);
+    mMesh.castShadow = true; mMesh.receiveShadow = true;
+    mAnchor.add(mMesh);
+    if (m.atmo) atmoMats.push({ mat: makeAtmosphere(m.radius, m.atmo, mAnchor), anchor:mAnchor });
+
+    /* moon orbit ring */
+    const g = track(new THREE.BufferGeometry());
+    const pts = new Float32Array(97 * 3);
+    for (let k = 0; k < 97; k++){
+      const th = k / 96 * TAU;
+      pts[k*3] = Math.cos(th) * m.dist; pts[k*3+1] = 0; pts[k*3+2] = Math.sin(th) * m.dist;
+    }
+    g.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+    const mm = track(new THREE.LineBasicMaterial({ color:new THREE.Color(m.color), transparent:true, opacity:0.16 }));
+    const mline = new THREE.Line(g, mm);
+    moonOrbit.add(mline);
+    moonOrbitLines.push({ line:mline, mat:mm, base:0.16 });
+
+    const mLabel = makeLabel(m.name, 'moon', m.color);
+    const mEntry = { data:m, anchor:mAnchor, mesh:mMesh, labelEl:mLabel, kind:m.kind,
+                     parent:entry, dist:m.dist, orbitLine:{ line:mline, mat:mm, base:0.16 } };
+    mLabel.addEventListener('click', e => { e.stopPropagation(); focusOn(mEntry); });
+    mMesh.userData.entry = mEntry;
+    entry.moons.push(mEntry);
+    entries.push(mEntry); pickables.push(mMesh);
+  });
+  return entry;
+}
+
+/* Build everything: the Sun first, then each planet (moons ride inside
+   their planet's tilt node, so they are created from within buildPlanet). */
+PLANETS.forEach(buildPlanet);
+
+/* =====================================================================
+   5. ASTEROID BELT (between Mars and Jupiter)
+   ===================================================================== */
+function buildBelt(count = 1500){
+  const geo = track(new THREE.IcosahedronGeometry(1, 0));
+  const mat = track(new THREE.MeshStandardMaterial({ color:0x9d8b78, roughness:1, metalness:0, flatShading:true }));
+  const mesh = new THREE.InstancedMesh(geo, mat, count);
+  mesh.frustumCulled = false;
+  const dummy = new THREE.Object3D();
+  const rocks = [];
+  for (let k = 0; k < count; k++){
+    const au = 2.06 + Math.pow(Math.random(), 0.8) * 1.28;       // 2.06 – 3.34 AU
+    const gap = Math.abs(au - 2.50) < 0.035 || Math.abs(au - 2.82) < 0.03 || Math.abs(au - 3.27) < 0.03; // Kirkwood gaps (3:1, 5:2, 2:1)
+    const r = fAU(au);
+    rocks.push({
+      r,
+      ang: Math.random() * TAU,
+      n: TAU / (Math.pow(au, 1.5) * 60),                        // Kepler's 3rd law (relative)
+      y: (Math.random() - 0.5) * 3.4 * Math.pow(Math.random(), 0.5),
+      s: 0.045 + Math.pow(Math.random(), 3) * 0.36,
+      rot: Math.random() * TAU, spin: (Math.random() - 0.5) * 1.2,
+      skip: gap
+    });
+    dummy.position.set(0, 9999, 0); dummy.scale.setScalar(0.001); dummy.updateMatrix();
+    mesh.setMatrixAt(k, dummy.matrix);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  scene.add(mesh);
+  return { mesh, rocks, dummy, count };
+}
+const belt = buildBelt(1500);
+
+/* selection indicator (billboarded additive ring) */
+const selMat = track(new THREE.SpriteMaterial({
+  map: track(texSelectRing()), color:0x9fd8ff, transparent:true, opacity:0.85,
+  depthWrite:false, blending:THREE.AdditiveBlending
+}));
+const selSprite = new THREE.Sprite(selMat);
+selSprite.visible = false;
+selSprite.renderOrder = 5;
+scene.add(selSprite);
+
+/* =====================================================================
+   6. ORBITAL MECHANICS + CAMERA FOCUS
+   ===================================================================== */
+let speed = 1, paused = false, lastSpeed = 1;
+let simDays = 0, keplerTrue = false;
+
+/* display period keeps Neptune watchable at 1x unless Kepler mode is on */
+const dispPeriod = d => keplerTrue ? d / (365.256 / 240) : Math.pow(d, 0.45) / (Math.pow(365.256, 0.45) / 240);
+
+function solveKepler(M, e){
+  let E = e < 0.8 ? M : Math.PI;
+  for (let k = 0; k < 5; k++) E -= (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+  return E;
+}
+
+/* mean elements at J2000 (deg/century) — gives a roughly real layout    */
+const ELEMS = {
+  Mercury:{ L:252.25084, Lr:149472.67411 }, Venus:{ L:181.97973, Lr:58517.81538 },
+  Earth:  { L:100.46435, Lr:35999.37245 }, Mars:  { L:355.45332, Lr:19140.30268 },
+  Jupiter:{ L:34.40438,  Lr:3034.74612  }, Saturn:{ L:49.94432,  Lr:1222.49362  },
+  Uranus: { L:313.23218, Lr:303.47788   }, Neptune:{ L:304.88267, Lr:298.10     }
+};
+
+/* Attach runtime state to every body now that the display-period law is known.
+   Planets start from their real J2000 mean anomaly; moons from a set phase. */
+const planetEntries = entries.filter(e => !!e.data.au);
+planetEntries.forEach(en => {
+  const p = en.data;
+  en.T  = dispPeriod(p.periodDays);
+  en.M0 = THREE.MathUtils.degToRad((ELEMS[p.name].L - p.peri) % 360);
+  en.spin = 0;
+});
+const moonEntries = entries.filter(e => !!e.parent);
+moonEntries.forEach(en => { en.T = dispPeriod(en.data.periodDays); en.M0 = en.data.phase || 0; en.r = en.data.dist; });
+
+const _wp = new THREE.Vector3(), _pp = new THREE.Vector3(), _sunDir = new THREE.Vector3();
+
+/* Advance one frame of simulated time.
+   dSim  = simulated days elapsed, dSpin = "hours-equivalent" for rotation. */
+function updateBodies(dSim, dSpin){
+  /* --- the Sun rotates once every 25.4 days (differential rotation is
+         faked in the shader by sliding the granulation layers) --------- */
+  sunEntry.mesh.rotation.y += TAU * dSpin / 609.1;      // 25.4 d x 24 h
+
+  /* --- planets: Kepler's equation on the real ellipse, then the radius
+         is pushed through the compression law f(rAU) so the shape stays
+         consistent with the drawn orbit line. -------------------------- */
+  for (const en of planetEntries){
+    const p = en.data;
+    const M = en.M0 + TAU * simDays / en.T;
+    const E = solveKepler(((M % TAU) + TAU) % TAU, p.ecc);
+    const b = Math.sqrt(1 - p.ecc * p.ecc);
+    const x = p.au * (Math.cos(E) - p.ecc), z = p.au * b * Math.sin(E);
+    const rAU = Math.hypot(x, z), th = Math.atan2(z, x), rs = fAU(rAU);
+    en.anchor.position.set(Math.cos(th) * rs, 0, Math.sin(th) * rs);
+    en.spin += TAU * dSpin / p.spinH;          // spinH is negative for retrograde
+    en.mesh.rotation.y = en.spin;
+    if (en.cloudMesh) en.cloudMesh.rotation.y = en.spin * 1.12;
+  }
+
+  /* --- moons: circular orbits in the parent's equatorial plane.
+         Tidally locked, so the same face points inward. ---------------- */
+  for (const en of moonEntries){
+    const th = en.M0 + (en.data.retro ? -1 : 1) * TAU * simDays / en.T;
+    en.anchor.position.set(Math.cos(th) * en.r, 0, Math.sin(th) * en.r);
+    en.mesh.rotation.y = th + Math.PI;
+  }
+
+  /* --- asteroid belt: Kepler's third law (n ∝ a^-1.5) ---------------- */
+  const dm = belt.dummy;
+  for (let k = 0; k < belt.count; k++){
+    const rk = belt.rocks[k];
+    if (rk.skip) continue;
+    rk.ang += rk.n * dSim;
+    rk.rot += rk.spin * dSpin * 0.02;
+    dm.position.set(Math.cos(rk.ang) * rk.r, rk.y, Math.sin(rk.ang) * rk.r);
+    dm.rotation.set(rk.rot, rk.rot * 0.7, rk.rot * 0.3);
+    dm.scale.setScalar(rk.s);
+    dm.updateMatrix();
+    belt.mesh.setMatrixAt(k, dm.matrix);
+  }
+  belt.mesh.instanceMatrix.needsUpdate = true;
+
+  /* --- fresnel atmospheres need the sun direction every frame -------- */
+  for (const a of atmoMats){
+    a.anchor.getWorldPosition(_pp);
+    _sunDir.copy(_pp).negate();
+    if (_sunDir.lengthSq() > 1e-6) _sunDir.normalize();
+    a.mat.uniforms.uSun.value.copy(_sunDir);
+  }
+}
+
+/* =====================================================================
+   6. SELECTION, CAMERA FOCUS / FOLLOW, HTML LABELS
+   ===================================================================== */
+let selected = null, follow = null, tween = null;
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+
+function entryColor(en){ return en.data.color; }
+
+function setSelected(en){
+  if (selected && selected.orbitLine) selected.orbitLine.mat.opacity = selected.orbitLine.base;
+  selected = en;
+  if (en && en.orbitLine) en.orbitLine.mat.opacity = Math.min(0.75, en.orbitLine.base * 3.2);
+  entries.forEach(e => e.labelEl.classList.toggle('sel', e === en));
+  if (en){
+    selSprite.visible = true;
+    selMat.color.set(entryColor(en));
+  } else {
+    selSprite.visible = false;
+  }
+  showInfo(en);
+}
+
+/* Smoothly fly the camera to a body, then keep following it.           */
+function focusOn(en, instant = false){
+  setSelected(en);
+  follow = en;
+  en.anchor.getWorldPosition(_wp);
+  const dist = Math.max(en.data.radius * 6.5, 1.4);
+  const dir = new THREE.Vector3().subVectors(camera.position, _wp);
+  if (dir.lengthSq() < 1e-4) dir.set(0.4, 0.35, 1);
+  dir.normalize();
+  dir.y = clamp(dir.y, 0.16, 0.7);                    // gentle top-down bias
+  dir.normalize().multiplyScalar(dist);
+  if (instant){
+    controls.target.copy(_wp);
+    camera.position.copy(_wp).add(dir);
+    tween = null;
+  } else {
+    tween = { t:0, dur:1.25, fromCam:camera.position.clone(), fromTarget:controls.target.clone(),
+              en, offset:dir };
+  }
+  en.anchor.getWorldPosition(_wp);
+  follow._prev = _wp.clone();
+}
+
+function releaseCamera(){ follow = null; tween = null; }
+
+function resetView(){
+  releaseCamera();
+  setSelected(null);
+  tween = { t:0, dur:1.1, fromCam:camera.position.clone(), fromTarget:controls.target.clone(),
+            en:{ anchor:scene, data:{ radius:0 } }, offset:new THREE.Vector3(0, 42, 118) };
+  follow = null;
+}
+
+/* --- picking ---------------------------------------------------------- */
+let downXY = null;
+renderer.domElement.addEventListener('pointerdown', ev => { downXY = { x:ev.clientX, y:ev.clientY }; });
+renderer.domElement.addEventListener('pointerup', ev => {
+  if (!downXY) return;
+  const moved = Math.hypot(ev.clientX - downXY.x, ev.clientY - downXY.y);
+  downXY = null;
+  if (moved > 6) return;                              // it was a drag, not a click
+  pointer.x = (ev.clientX / innerWidth) * 2 - 1;
+  pointer.y = -(ev.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hit = raycaster.intersectObjects(pickables, false)[0];
+  if (hit && hit.object.userData.entry) focusOn(hit.object.userData.entry);
+});
+
+/* hover: cursor + label hint (throttled to ~25 Hz)                     */
+let hoverT = 0, hovered = null;
+renderer.domElement.addEventListener('pointermove', ev => { pointer.x = (ev.clientX / innerWidth) * 2 - 1; pointer.y = -(ev.clientY / innerHeight) * 2 + 1; });
+function updateHover(now){
+  if (now - hoverT < 40) return;
+  hoverT = now;
+  raycaster.setFromCamera(pointer, camera);
+  const hit = raycaster.intersectObjects(pickables, false)[0];
+  const en = hit && hit.object.userData.entry ? hit.object.userData.entry : null;
+  if (en !== hovered){
+    hovered = en;
+    renderer.domElement.style.cursor = en ? 'pointer' : 'grab';
+  }
+}
+
+/* --- projected HTML labels ------------------------------------------- */
+const _v = new THREE.Vector3();
+function updateLabels(){
+  for (const en of entries){
+    const elx = en.labelEl;
+    if (!labelsOn){ elx.style.display = 'none'; continue; }
+    en.anchor.getWorldPosition(_v);
+    const camDist = camera.position.distanceTo(_v);
+    /* hide moon labels until you are close enough to care */
+    if (en.parent){
+      en.parent.anchor.getWorldPosition(_pp);
+      const near = camera.position.distanceTo(_pp) < 26 + 6.2 * en.parent.data.radius;
+      if (!near && en !== selected && en !== follow){ elx.style.display = 'none'; continue; }
+    }
+    _v.project(camera);
+    if (_v.z > 1 || _v.x < -1.25 || _v.x > 1.25 || _v.y < -1.25 || _v.y > 1.25){ elx.style.display = 'none'; continue; }
+    const x = (_v.x * 0.5 + 0.5) * innerWidth, y = (-_v.y * 0.5 + 0.5) * innerHeight;
+    elx.style.display = 'block';
+    elx.style.left = x + 'px';
+    elx.style.top = (y - en.data.radius * 0.2) + 'px';
+    /* fade small/distant bodies so the scene stays readable */
+    const vis = clamp((en.data.radius * 900) / camDist, 0.25, 1);
+    elx.style.opacity = (en.parent ? 0.75 : 1) * vis;
+  }
+}
+
+/* =====================================================================
+   7. HUD, CONTROLS WIRING, ANIMATION LOOP
+   ===================================================================== */
+const $ = id => document.getElementById(id);
+const infoEl = $('info');
+let labelsOn = true, orbitsOn = true, moonOrbitsOn = true, bloomOn = true;
+
+/* --- info card -------------------------------------------------------- */
+const factRows = f => Object.entries(f).map(([k, v]) => `<div><span>${k}</span><b>${v}</b></div>`).join('');
+function showInfo(en){
+  if (!en){ infoEl.classList.add('hidden'); infoEl.innerHTML = ''; return; }
+  const d = en.data;
+  const kids = (en.moons && en.moons.length ? en.moons : []).map(m =>
+    `<button class="chip" data-moon="${m.data.name}"><i style="background:${m.data.color}"></i>${m.data.name}</button>`).join('');
+  infoEl.innerHTML = `
+    <div class="swatch" style="background:radial-gradient(circle at 35% 32%, #ffffff 0%, ${d.color} 55%, rgba(0,0,0,.85) 130%)"></div>
+    <h2>${d.name}</h2><div class="kind">${en.kind}</div><div class="clear"></div>
+    <div class="facts">${factRows(d.facts)}</div>
+    <div class="fun"><b>Fun fact</b><br>${d.fun}</div>
+    ${kids ? `<div class="k" style="display:block;margin-bottom:6px">Moons rendered here — click to focus</div><div class="row wrap">${kids}</div>` : ''}
+    <div class="row">
+      <button class="big" data-act="focus">Keep in view</button>
+      <button class="big" data-act="free">Free camera</button>
+    </div>`;
+  infoEl.classList.remove('hidden');
+  infoEl.querySelectorAll('[data-moon]').forEach(b => b.addEventListener('click', () => {
+    const t = en.moons.find(m => m.data.name === b.dataset.moon);
+    if (t) focusOn(t);
+  }));
+  infoEl.querySelector('[data-act=focus]').addEventListener('click', () => focusOn(en));
+  infoEl.querySelector('[data-act=free]').addEventListener('click', releaseCamera);
+}
+
+/* --- body shortcut chips ---------------------------------------------- */
+const bodyList = $('body-list');
+const shortcuts = entries.filter(e => !e.parent);       // Sun + 8 planets
+shortcuts.forEach((en, idx) => {
+  const b = document.createElement('button');
+  b.className = 'chip';
+  b.innerHTML = `<i style="background:${en.data.color}"></i>${en.data.name}`;
+  b.title = idx === 0 ? 'press 0' : 'press ' + idx;
+  b.addEventListener('click', () => focusOn(en));
+  bodyList.appendChild(b);
+});
+
+/* --- speed ------------------------------------------------------------ */
+const spdSlider = $('speed'), spdVal = $('spd-val'), rdSpeed = $('rd-speed');
+const speedBtns = [...document.querySelectorAll('[data-speed]')];
+function setSpeed(v, fromSlider = false){
+  speed = clamp(v, 0, 20);
+  if (!fromSlider) spdSlider.value = speed.toFixed(1);
+  spdVal.textContent = speed.toFixed(1) + '×';
+  rdSpeed.textContent = speed.toFixed(1) + '×';
+  speedBtns.forEach(b => b.classList.toggle('on', !paused && Math.abs(parseFloat(b.dataset.speed) - speed) < 1e-6));
+}
+speedBtns.forEach(b => b.addEventListener('click', () => { setPaused(false); setSpeed(parseFloat(b.dataset.speed)); }));
+spdSlider.addEventListener('input', () => { setPaused(false); setSpeed(parseFloat(spdSlider.value), true); });
+const btnPlay = $('btn-play');
+function setPaused(p){
+  paused = p;
+  btnPlay.textContent = paused ? '▶' : '❚❚';
+  btnPlay.classList.toggle('on', !paused);
+  speedBtns.forEach(b => b.classList.toggle('on', !paused && Math.abs(parseFloat(b.dataset.speed) - speed) < 1e-6));
+}
+btnPlay.addEventListener('click', () => setPaused(!paused));
+
+/* --- Kepler mode re-maps every period, so restart phases smoothly ---- */
+$('t-kepler').addEventListener('change', e => {
+  keplerTrue = e.target.checked;
+  planetEntries.forEach(en => {
+    en.T = dispPeriod(en.data.periodDays);
+    en.M0 = THREE.MathUtils.degToRad((ELEMS[en.data.name].L - en.data.peri) % 360);
+  });
+  moonEntries.forEach(en => { en.T = dispPeriod(en.data.periodDays); });
+  $('clock-hint').innerHTML = keplerTrue
+    ? 'Kepler mode: true relative speeds — outer planets crawl (Neptune takes 165 years).'
+    : 'Compressed periods keep every planet moving. Tick <b>Kepler</b> for true relative speeds.';
+});
+
+/* --- display toggles -------------------------------------------------- */
+$('t-orbits').addEventListener('change', e => { orbitsOn = e.target.checked; orbitLines.forEach(o => o.line.visible = orbitsOn); });
+$('t-moonorbits').addEventListener('change', e => { moonOrbitsOn = e.target.checked; moonOrbitLines.forEach(o => o.line.visible = moonOrbitsOn); });
+$('t-labels').addEventListener('change', e => { labelsOn = e.target.checked; });
+$('t-belt').addEventListener('change', e => { belt.mesh.visible = e.target.checked; });
+$('t-stars').addEventListener('change', e => { starGroup.visible = e.target.checked; });
+$('t-bloom').addEventListener('change', e => { bloomOn = e.target.checked; applyQuality(qualityIndex); });
+
+/* --- render quality --------------------------------------------------- */
+const QUALITY = [
+  { pr:0.75, bloom:false, shadows:false, belt:600,  shadowMap:1024 },
+  { pr:Math.min(window.devicePixelRatio || 1, 1.5), bloom:true, shadows:true, belt:1500, shadowMap:1024 },
+  { pr:Math.min(window.devicePixelRatio || 1, 2),   bloom:true, shadows:true, belt:1500, shadowMap:2048 }
+];
+let qualityIndex = 1;
+function applyQuality(i){
+  qualityIndex = i;
+  const q = QUALITY[i];
+  renderer.setPixelRatio(q.pr);
+  renderer.shadowMap.enabled = q.shadows;
+  sunLight.castShadow = q.shadows;
+  if (sunLight.shadow.mapSize.x !== q.shadowMap){
+    sunLight.shadow.mapSize.set(q.shadowMap, q.shadowMap);
+    if (sunLight.shadow.map){ sunLight.shadow.map.dispose(); sunLight.shadow.map = null; }
+  }
+  belt.mesh.count = q.belt;
+  useBloom = bloomOn && q.bloom;
+  bloom.strength = 0.85;
+  scene.traverse(o => {
+    if (!o.material) return;
+    (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => { m.needsUpdate = true; });
+  });
+  onResize();
+}
+$('q').addEventListener('change', e => applyQuality(parseInt(e.target.value, 10)));
+$('btn-reset').addEventListener('click', resetView);
+$('panel-toggle').addEventListener('click', () => $('panel').classList.toggle('open'));
+
+/* --- keyboard --------------------------------------------------------- */
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  const k = e.key;
+  if (k === ' '){ e.preventDefault(); setPaused(!paused); }
+  else if (k === 'ArrowUp'){ setPaused(false); setSpeed(speed * 1.4); }
+  else if (k === 'ArrowDown'){ setPaused(false); setSpeed(speed / 1.4); }
+  else if (k >= '0' && k <= '8'){ focusOn(shortcuts[parseInt(k, 10)]); }
+  else if (k === 'r' || k === 'R'){ resetView(); }
+  else if (k === 'Escape'){ releaseCamera(); }
+});
+
+/* --- resize ----------------------------------------------------------- */
+function onResize(){
+  const w = innerWidth, h = innerHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+  composer.setSize(w, h);
+}
+addEventListener('resize', onResize);
+
+/* --- animation loop --------------------------------------------------- */
+const clock = new THREE.Clock();
+const rdDate = $('rd-date'), rdCam = $('rd-cam'), rdFps = $('rd-fps');
+let frames = 0, fpsT = 0, fps = 60;
+const easeIO = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const rate = paused ? 0 : speed;
+
+  /* simulated time: DAYS_PER_SEC days per real second at 1x */
+  const dSim  = dt * DAYS_PER_SEC * rate;
+  const dSpin = dt * 24 * SPIN_SCALE * rate;
+  simDays += dSim;
+  updateBodies(dSim, dSpin);
+  sunEntry.sunMat.uniforms.uTime.value += dt * (rate > 0 ? 1 + Math.min(rate, 8) * 0.12 : 0.25);
+
+  /* camera: fly-to tween, then ride along with the followed body */
+  if (tween){
+    tween.t = Math.min(1, tween.t + dt / tween.dur);
+    const k = easeIO(tween.t);
+    tween.en.anchor.getWorldPosition(_wp);
+    controls.target.lerpVectors(tween.fromTarget, _wp, k);
+    camera.position.lerpVectors(tween.fromCam, _wp.clone().add(tween.offset), k);
+    if (follow && follow === tween.en) follow._prev.copy(_wp);
+    if (tween.t >= 1) tween = null;
+  } else if (follow){
+    follow.anchor.getWorldPosition(_wp);
+    _pp.copy(_wp).sub(follow._prev);
+    follow._prev.copy(_wp);
+    controls.target.add(_pp);
+    camera.position.add(_pp);
+  }
+
+  /* selection ring hugs the body and pulses */
+  if (selected){
+    selected.anchor.getWorldPosition(_wp);
+    selSprite.position.copy(_wp);
+    const s = selected.data.radius * (3.1 + 0.25 * Math.sin(performance.now() * 0.003));
+    selSprite.scale.set(s, s, 1);
+  }
+
+  controls.update();
+  updateHover(performance.now());
+  updateLabels();
+
+  if (useBloom) composer.render(); else renderer.render(scene, camera);
+
+  /* readouts */
+  frames++; fpsT += dt;
+  if (fpsT > 0.5){ fps = Math.round(frames / fpsT); frames = 0; fpsT = 0; rdFps.textContent = fps; }
+  rdDate.textContent = new Date(EPOCH + simDays * 86400000).toISOString().slice(0, 10);
+  rdCam.textContent = camera.position.length().toFixed(0) + ' u';
+}
+
+/* --- tidy up on unload ------------------------------------------------ */
+addEventListener('beforeunload', () => {
+  disposables.forEach(o => { if (o && typeof o.dispose === 'function') o.dispose(); });
+  controls.dispose(); renderer.dispose();
+});
+
+applyQuality(1);
+setSpeed(1);
+onResize();
+animate();
+requestAnimationFrame(() => $('loader').classList.add('gone'));
